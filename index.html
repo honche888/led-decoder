@@ -1,113 +1,260 @@
 <!DOCTYPE html>
 <html lang="zh-Hant">
 <head>
-  <meta charset="UTF-8" />
-  <title>LED Rolling Shutter Decoder (升級版可解碼)</title>
-  <style>
-    body { background:#0d1117; color:#e6edf3; font-family:Arial; text-align:center; padding:20px; }
-    button { padding:10px 20px; font-size:16px; cursor:pointer; margin:10px; border-radius:5px; }
-    #video { width:90%; max-width:400px; margin-top:15px; }
-    #result, #bitStream { background:#161b22; padding:12px; border-radius:6px; margin:10px auto; width:90%; max-width:500px; }
-  </style>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>⚡ OPTICAL LINK // DECODER</title>
+    <style>
+        :root { --neon-green: #0f0; --neon-red: #f00; --dark-bg: #050505; --panel: #111; }
+        body { background: var(--dark-bg); color: var(--neon-green); font-family: 'Courier New', monospace; margin: 0; padding: 0; overflow-x: hidden; }
+        
+        /* Cyberpunk UI Container */
+        .hud-container { display: flex; flex-direction: column; align-items: center; padding: 10px; }
+        
+        h2 { text-shadow: 0 0 10px var(--neon-green); margin: 10px 0; letter-spacing: 2px; font-size: 1.2rem; }
+        
+        /* Video & Canvas Overlay */
+        .viewport { position: relative; width: 90vw; max-width: 400px; height: 300px; border: 2px solid var(--neon-green); box-shadow: 0 0 15px rgba(0, 255, 0, 0.3); overflow: hidden; background: #000; }
+        video { width: 100%; height: 100%; object-fit: cover; opacity: 0.8; }
+        #waveCanvas { position: absolute; bottom: 0; left: 0; width: 100%; height: 100px; background: rgba(0, 20, 0, 0.5); border-top: 1px solid var(--neon-green); }
+        .crosshair { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 20px; height: 20px; border: 2px solid red; z-index: 10; pointer-events: none; }
+        
+        /* Controls */
+        .controls { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; width: 90vw; max-width: 400px; margin-top: 15px; }
+        button { background: var(--panel); border: 1px solid var(--neon-green); color: var(--neon-green); padding: 12px; font-size: 14px; cursor: pointer; text-transform: uppercase; transition: 0.2s; font-weight: bold; }
+        button:active { background: var(--neon-green); color: black; box-shadow: 0 0 10px var(--neon-green); }
+        button.stop { border-color: var(--neon-red); color: var(--neon-red); }
+        button.stop:active { background: var(--neon-red); color: white; }
+
+        /* Status Panels */
+        .panel { width: 90vw; max-width: 400px; background: var(--panel); border: 1px dashed #333; margin-top: 10px; padding: 10px; box-sizing: border-box; }
+        .label { font-size: 12px; color: #888; display: block; margin-bottom: 5px; }
+        .value { font-size: 18px; word-break: break-all; letter-spacing: 3px; }
+        
+        /* Settings */
+        .settings { display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: #aaa; margin-top: 5px; width: 90vw; max-width: 400px; }
+        input[type="number"] { background: #222; border: 1px solid #555; color: white; width: 60px; padding: 5px; text-align: center; }
+
+        /* Indicator */
+        #signalState { width: 20px; height: 20px; border-radius: 50%; background: #333; display: inline-block; vertical-align: middle; margin-right: 10px; border: 1px solid #555; }
+        .high { background: #0f0 !important; box-shadow: 0 0 10px #0f0; }
+        .low { background: #000 !important; }
+
+    </style>
 </head>
-
 <body>
-  <h2>📸 LED Rolling Shutter 解碼器（可偵測 HEADER + PAYLOAD）</h2>
 
-  <button onclick="startCamera()">啟動相機</button>
-  <button onclick="stopCamera()">停止</button>
+<div class="hud-container">
+    <h2>// SIGNAL DECODER v2.0</h2>
 
-  <br>
-  <video id="video" autoplay playsinline></video>
-  <canvas id="canvas" style="display:none;"></canvas>
+    <div class="viewport">
+        <video id="video" autoplay playsinline></video>
+        <canvas id="canvas" style="display:none;"></canvas>
+        <div class="crosshair"></div>
+        <canvas id="waveCanvas"></canvas>
+    </div>
 
-  <h3>📶 Bit Stream（即時二值化資料）</h3>
-  <div id="bitStream">等待中…</div>
+    <div class="settings">
+        <span>SPEED (ms/bit):</span>
+        <input type="number" id="bitDuration" value="500">
+    </div>
 
-  <h3>🧾 協定解碼結果（HEADER + PAYLOAD）</h3>
-  <div id="result">等待有效 frame…</div>
+    <div class="panel">
+        <span class="label">CALIBRATION (請先校正!)</span>
+        <div style="display:flex; justify-content:space-between; margin-bottom:5px;">
+            <span id="debugVals">Min: 0 | Max: 255 | Thresh: 128</span>
+        </div>
+        <div class="controls" style="margin-top:0; grid-template-columns: 1fr 1fr;">
+            <button onclick="calibrate('low')">1. 鎖定全黑</button>
+            <button onclick="calibrate('high')">2. 鎖定全亮</button>
+        </div>
+    </div>
+
+    <div class="controls">
+        <button onclick="startProcessing()" id="btnStart">啟動監聽</button>
+        <button onclick="resetData()" class="stop">清除數據</button>
+    </div>
+
+    <div class="panel">
+        <span class="label">LIVE STATUS</span>
+        <div id="signalState"></div> <span id="currentBit">WAITING...</span>
+    </div>
+
+    <div class="panel">
+        <span class="label">DECODED BITS (Raw Stream)</span>
+        <div class="value" id="bitStream">...</div>
+    </div>
+</div>
 
 <script>
-  let video = document.getElementById("video");
-  let canvas = document.getElementById("canvas");
-  let ctx = canvas.getContext("2d");
-  let streaming = false;
-  let receivedBits = [];
+    const video = document.getElementById("video");
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+    const waveCanvas = document.getElementById("waveCanvas");
+    const waveCtx = waveCanvas.getContext("2d");
 
-  const HEADER = "10101011";
-  let foundHeader = false;
-  let bitBuffer = "";
+    let isProcessing = false;
+    let brightnessHistory = new Array(100).fill(0); // For waveform
+    
+    // Decoding Logic Variables
+    let minBright = 0;
+    let maxBright = 255;
+    let threshold = 128;
+    
+    let lastState = -1; // 0 or 1
+    let lastStateChangeTime = 0;
+    let decodedBits = "";
+    
+    // Setup Camera
+    navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } })
+        .then(stream => {
+            video.srcObject = stream;
+            requestAnimationFrame(processFrame);
+        })
+        .catch(err => alert("相機啟動失敗: " + err));
 
-  async function startCamera() {
-    try {
-      let stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
-      video.srcObject = stream;
-      streaming = true;
-      analyzeFrame();
-    } catch (err) {
-      alert("無法啟動相機: " + err);
-    }
-  }
+    function processFrame() {
+        if (video.readyState === video.HAVE_ENOUGH_DATA) {
+            canvas.width = 100; // Small resolution is enough for brightness
+            canvas.height = 100;
+            
+            // Draw center of video to canvas
+            let sx = (video.videoWidth - 100) / 2;
+            let sy = (video.videoHeight - 100) / 2;
+            ctx.drawImage(video, sx, sy, 100, 100, 0, 0, 100, 100);
 
-  function stopCamera() {
-    if (video.srcObject) {
-      video.srcObject.getTracks().forEach(track => track.stop());
-    }
-    streaming = false;
-  }
+            // Calculate Average Brightness of center 20x20 pixels
+            let frame = ctx.getImageData(40, 40, 20, 20).data;
+            let total = 0;
+            for (let i = 0; i < frame.length; i += 4) {
+                // RGB to Grayscale
+                total += (frame[i] * 0.299 + frame[i+1] * 0.587 + frame[i+2] * 0.114);
+            }
+            let avg = total / (frame.length / 4);
 
-  function analyzeFrame() {
-    if (!streaming) return;
+            // Update Waveform
+            updateWaveform(avg);
 
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-
-    let frame = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
-
-    // 🔍 擷取畫面中央區域平均亮度
-    let brightnessSum = 0, count = 0;
-    for (let y = canvas.height*0.4; y < canvas.height*0.6; y++) {
-      for (let x = canvas.width*0.4; x < canvas.width*0.6; x++) {
-        let idx = (y * canvas.width + x) * 4;
-        let Y = 0.299 * frame[idx] + 0.587 * frame[idx+1] + 0.114 * frame[idx+2];
-        brightnessSum++;
-        count++;
-      }
-    }
-
-    let avgBrightness = brightnessSum / count;
-
-    // 🟢 二值化：將亮度 → bit
-    let bit = avgBrightness > 130 ? "1" : "0";
-    bitBuffer += bit;
-
-    // 顯示即時 bit stream
-    document.getElementById("bitStream").innerText = bitBuffer.slice(-80);
-
-    // 🔎 尋找 HEADER
-    if (!foundHeader && bitBuffer.includes(HEADER)) {
-      foundHeader = true;
-      let startIndex = bitBuffer.indexOf(HEADER) + HEADER.length;
-      let payloadBits = bitBuffer.slice(startIndex, startIndex + 40); // 取後面 40 bits
-
-      if (payloadBits.length >= 8) {
-        let decodedText = bitsToText(payloadBits);
-        document.getElementById("result").innerText = "📩 解碼成功： " + decodedText;
-      }
+            if (isProcessing) {
+                decodeSignal(avg);
+            }
+        }
+        requestAnimationFrame(processFrame);
     }
 
-    requestAnimationFrame(analyzeFrame);
-  }
+    // --- 波形圖繪製 (Visualizer) ---
+    function updateWaveform(val) {
+        brightnessHistory.push(val);
+        brightnessHistory.shift();
 
-  function bitsToText(bits) {
-    let text = "";
-    for (let i = 0; i < bits.length; i += 8) {
-      let charCode = parseInt(bits.slice(i, i+8), 2);
-      text += String.fromCharCode(charCode);
+        waveCanvas.width = waveCanvas.offsetWidth;
+        waveCanvas.height = waveCanvas.offsetHeight;
+        
+        waveCtx.clearRect(0, 0, waveCanvas.width, waveCanvas.height);
+        waveCtx.beginPath();
+        waveCtx.strokeStyle = "#0f0";
+        waveCtx.lineWidth = 2;
+
+        let step = waveCanvas.width / brightnessHistory.length;
+        for(let i=0; i<brightnessHistory.length; i++) {
+            let y = waveCanvas.height - (brightnessHistory[i] / 255 * waveCanvas.height);
+            if(i===0) waveCtx.moveTo(0, y);
+            else waveCtx.lineTo(i * step, y);
+        }
+        waveCtx.stroke();
+
+        // Draw Threshold Line
+        let threshY = waveCanvas.height - (threshold / 255 * waveCanvas.height);
+        waveCtx.beginPath();
+        waveCtx.strokeStyle = "red";
+        waveCtx.setLineDash([5, 5]);
+        waveCtx.moveTo(0, threshY);
+        waveCtx.lineTo(waveCanvas.width, threshY);
+        waveCtx.stroke();
     }
-    return text;
-  }
+
+    // --- 校正邏輯 ---
+    let tempMin = 255, tempMax = 0;
+    function calibrate(type) {
+        // Take a snapshot of current average from history
+        let current = brightnessHistory[brightnessHistory.length - 1];
+        if (type === 'low') {
+            minBright = current;
+        } else {
+            maxBright = current;
+        }
+        // Update Threshold
+        threshold = (minBright + maxBright) / 2;
+        document.getElementById('debugVals').innerText = 
+            `Min: ${Math.floor(minBright)} | Max: ${Math.floor(maxBright)} | Thresh: ${Math.floor(threshold)}`;
+    }
+
+    // --- 核心解碼邏輯 (Pulse Width) ---
+    function decodeSignal(brightness) {
+        let currentState = brightness > threshold ? 1 : 0;
+        let now = Date.now();
+        let bitDuration = parseInt(document.getElementById('bitDuration').value);
+
+        // Visual Indicator
+        let indicator = document.getElementById('signalState');
+        if(currentState === 1) {
+            indicator.className = "high";
+            document.getElementById('currentBit').innerText = "HIGH (1)";
+        } else {
+            indicator.className = "low";
+            document.getElementById('currentBit').innerText = "LOW (0)";
+        }
+
+        // Logic: Detect Edge (Transition)
+        if (currentState !== lastState) {
+            if (lastState !== -1) {
+                // Calculate how long we were in the PREVIOUS state
+                let duration = now - lastStateChangeTime;
+                
+                // Round to nearest bit count
+                // E.g., if duration is 480ms (target 500), result is 1 bit.
+                // If duration is 980ms, result is 2 bits.
+                // We add 0.5 to round properly (e.g. 1.8 -> 2)
+                let numBits = Math.round(duration / bitDuration);
+
+                // Filter noise (very short spikes < 50% of a bit)
+                if (duration > (bitDuration * 0.4)) {
+                    for (let i = 0; i < numBits; i++) {
+                        decodedBits += lastState;
+                    }
+                    updateDisplay();
+                }
+            }
+            // Update State
+            lastState = currentState;
+            lastStateChangeTime = now;
+        }
+    }
+
+    function updateDisplay() {
+        document.getElementById('bitStream').innerText = decodedBits;
+    }
+
+    function startProcessing() {
+        isProcessing = true;
+        lastState = -1; // Reset state
+        lastStateChangeTime = Date.now();
+        decodedBits = ""; // Clear previous but keep running
+        document.getElementById('btnStart').innerText = "正在接收...";
+        document.getElementById('btnStart').style.background = "#0f0";
+        document.getElementById('btnStart').style.color = "#000";
+    }
+
+    function resetData() {
+        decodedBits = "";
+        lastState = -1;
+        isProcessing = false;
+        document.getElementById('bitStream').innerText = "...";
+        document.getElementById('btnStart').innerText = "啟動監聽";
+        document.getElementById('btnStart').style.background = "";
+        document.getElementById('btnStart').style.color = "";
+    }
+
 </script>
 </body>
 </html>
