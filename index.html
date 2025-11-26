@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <title>Rolling Shutter LED 解碼 Demo（純前端）</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #020617;
+      color: #e5e7eb;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 12px;
+      gap: 12px;
+    }
+    h1 {
+      font-size: 1.1rem;
+      text-align: center;
+      margin: 4px 0;
+    }
+    #video {
+      width: 100%;
+      max-width: 480px;
+      border-radius: 12px;
+      border: 2px solid #38bdf8;
+      background: #020617;
+    }
+    .btn {
+      padding: 10px 16px;
+      border-radius: 999px;
+      border: none;
+      font-size: 0.95rem;
+      font-weight: 600;
+      cursor: pointer;
+      background: #38bdf8;
+      color: #0f172a;
+      margin-top: 4px;
+    }
+    .btn:active {
+      transform: scale(0.97);
+    }
+    .panel {
+      width: 100%;
+      max-width: 480px;
+      background: #020617;
+      border-radius: 12px;
+      padding: 10px 12px;
+      box-sizing: border-box;
+      border: 1px solid #1e293b;
+    }
+    .label {
+      font-size: 0.8rem;
+      color: #9ca3af;
+      margin-bottom: 4px;
+    }
+    #brightnessCanvas, #stripeHeatmap {
+      width: 100%;
+      height: 80px;
+      background: #020617;
+      border-radius: 8px;
+      border: 1px solid #1e293b;
+    }
+    #bitOutput, #decodeOutput {
+      font-family: "SF Mono", Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      font-size: 0.75rem;
+      word-wrap: break-word;
+      word-break: break-all;
+      background: #020617;
+      padding: 6px 8px;
+      border-radius: 8px;
+      border: 1px solid #1e293b;
+      max-height: 120px;
+      overflow-y: auto;
+    }
+    small {
+      font-size: 0.7rem;
+      color: #6b7280;
+    }
+    .status-ok { color: #22c55e; }
+    .status-bad { color: #f97316; }
+  </style>
+</head>
+<body>
+  <h1>Rolling Shutter LED 解碼 Demo（純前端 Prototype）</h1>
+  <small>
+    步驟：啟動相機 → 對準正在 PWM 閃爍的 LED → 調整距離與角度 → 觀察下方 bit 與解碼結果。<br/>
+    協定：<code>HEADER = 10101011</code> + <code>PAYLOAD = 8 bits（1 個 ASCII 字元）</code>
+  </small>
+
+  <video id="video" playsinline autoplay muted></video>
+  <canvas id="hiddenCanvas" style="display:none;"></canvas>
+
+  <button id="startBtn" class="btn">啟動相機</button>
+
+  <div class="panel">
+    <div class="label">全畫面垂直亮度分佈（用來找哪裡最亮）：</div>
+    <canvas id="stripeHeatmap"></canvas>
+  </div>
+
+  <div class="panel">
+    <div class="label">選到的 LED Stripe 亮度曲線（y 方向）：</div>
+    <canvas id="brightnessCanvas"></canvas>
+  </div>
+
+  <div class="panel">
+    <div class="label">壓縮後的 bit 串（經自適應 threshold + 去雜訊）：</div>
+    <div id="bitOutput">尚未開始解碼...</div>
+  </div>
+
+  <div class="panel">
+    <div class="label">協定解碼結果（HEADER + PAYLOAD）：</div>
+    <div id="decodeOutput">等待有效 frame...</div>
+  </div>
+
+  <script>
+    const video = document.getElementById("video");
+    const hiddenCanvas = document.getElementById("hiddenCanvas");
+    const brightnessCanvas = document.getElementById("brightnessCanvas");
+    const stripeHeatmap = document.getElementById("stripeHeatmap");
+    const bitOutput = document.getElementById("bitOutput");
+    const decodeOutput = document.getElementById("decodeOutput");
+    const startBtn = document.getElementById("startBtn");
+
+    let stream = null;
+    let decodingInterval = null;
+
+    async function startCamera() {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: { ideal: "environment" },
+            width: { ideal: 640 },
+            height: { ideal: 480 }
+          },
+          audio: false
+        });
+        video.srcObject = stream;
+        video.onloadedmetadata = () => {
+          video.play();
+          initCanvas();
+          startDecodingLoop();
+          startBtn.textContent = "相機已啟動";
+          startBtn.disabled = true;
+        };
+      } catch (err) {
+        console.error("無法啟動相機：", err);
+        alert("無法啟動相機，請確認權限已開啟，且在 HTTPS 網站上測試。");
+      }
+    }
+
+    function initCanvas() {
+      hiddenCanvas.width = video.videoWidth || 640;
+      hiddenCanvas.height = video.videoHeight || 480;
+
+      const rect1 = brightnessCanvas.getBoundingClientRect();
+      brightnessCanvas.width = rect1.width;
+      brightnessCanvas.height = rect1.height;
+
+      const rect2 = stripeHeatmap.getBoundingClientRect();
+      stripeHeatmap.width = rect2.width;
+      stripeHeatmap.height = rect2.height;
+    }
+
+    function startDecodingLoop() {
+      if (decodingInterval) clearInterval(decodingInterval);
+      decodingInterval = setInterval(() => {
+        if (video.readyState >= 2) {
+          decodeFrame();
+        }
+      }, 120); // 每 120ms 解一次
+    }
+
+    function decodeFrame() {
+      const w = hiddenCanvas.width;
+      const h = hiddenCanvas.height;
+      if (!w || !h) return;
+
+      const ctx = hiddenCanvas.getContext("2d");
+      ctx.drawImage(video, 0, 0, w, h);
+      const frame = ctx.getImageData(0, 0, w, h).data;
+
+      // ---- 1) 掃描每一個 column 的亮度總和，找出最像 LED 的幾個 column ----
+      const colBrightness = new Array(w).fill(0);
+      for (let x = 0; x < w; x++) {
+        let sum = 0;
+        for (let y = 0; y < h; y++) {
+          const idx = (y * w + x) * 4;
+          const r = frame[idx];
+          const g = frame[idx + 1];
+          const b = frame[idx + 2];
+          sum += (r + g + b) / 3;
+        }
+        colBrightness[x] = sum / h;
+      }
+
+      // 畫出垂直亮度分佈，方便觀察 LED 在哪
+      drawStripeHeatmap(colBrightness);
+
+      // 找亮度最高的 column 區域（取前 N 個）
+      const N = 5;
+      const indices = colBrightness.map((v, i) => ({ v, i }))
+        .sort((a, b) => b.v - a.v)
+        .slice(0, N)
+        .map(o => o.i)
+        .sort((a, b) => a - b);
+
+      if (!indices.length) {
+        bitOutput.textContent = "(找不到亮區)";
+        return;
+      }
+
+      // 在這幾個最亮 column 做平均，得到一條 y 方向亮度曲線
+      const stripe = [];
+      for (let y = 0; y < h; y++) {
+        let sum = 0;
+        for (const x of indices) {
+          const idx = (y * w + x) * 4;
+          const r = frame[idx];
+          const g = frame[idx + 1];
+          const b = frame[idx + 2];
+          sum += (r + g + b) / 3;
+        }
+        stripe.push(sum / indices.length);
+      }
+
+      // 正規化 0~1
+      const minB = Math.min(...stripe);
+      const maxB = Math.max(...stripe);
+      const norm = stripe.map(v => (maxB - minB > 0 ? (v - minB) / (maxB - minB) : 0));
+
+      drawBrightness(norm);
+
+      // 將亮度序列轉成 bit 串（含自適應 threshold + 去雜訊）
+      const bits = brightnessToBits(norm);
+      bitOutput.textContent = bits.length ? bits : "(無穩定條紋 / 等待穩定影像)";
+
+      // 試著根據協定解碼：HEADER(10101011) + PAYLOAD(8 bits)
+      const decoded = decodeProtocol(bits);
+      if (decoded) {
+        decodeOutput.innerHTML =
+          `<span class="status-ok">✅ 有效 frame</span><br/>` +
+          `Header: ${decoded.header}<br/>` +
+          `Payload bits: ${decoded.payloadBits}<br/>` +
+          `ASCII: <b>${decoded.char}</b> (code: ${decoded.code})`;
+      } else {
+        decodeOutput.innerHTML =
+          `<span class="status-bad">⌛ 等待有效 HEADER + PAYLOAD...</span><br/>` +
+          `請調整距離 / 角度 / LED 亮度 或重新對準 LED。`;
+      }
+    }
+
+    function drawStripeHeatmap(colBrightness) {
+      const ctx = stripeHeatmap.getContext("2d");
+      const w = stripeHeatmap.width;
+      const h = stripeHeatmap.height;
+      ctx.clearRect(0, 0, w, h);
+
+      const minB = Math.min(...colBrightness);
+      const maxB = Math.max(...colBrightness) || 1;
+
+      ctx.beginPath();
+      ctx.moveTo(0, h);
+      for (let x = 0; x < colBrightness.length; x++) {
+        const nx = (x / (colBrightness.length - 1)) * w;
+        const n = (colBrightness[x] - minB) / (maxB - minB);
+        const ny = h - n * h;
+        ctx.lineTo(nx, ny);
+      }
+      ctx.strokeStyle = "#facc15";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+
+    function drawBrightness(norm) {
+      const ctx = brightnessCanvas.getContext("2d");
+      const w = brightnessCanvas.width;
+      const h = brightnessCanvas.height;
+      ctx.clearRect(0, 0, w, h);
+
+      ctx.beginPath();
+      ctx.moveTo(0, h);
+      for (let i = 0; i < norm.length; i++) {
+        const x = (i / (norm.length - 1)) * w;
+        const y = h - norm[i] * h;
+        ctx.lineTo(x, y);
+      }
+      ctx.strokeStyle = "#38bdf8";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+
+    // 自適應 threshold + run-length 去雜訊
+    function brightnessToBits(norm) {
+      if (!norm.length) return "";
+
+      // 計算平均與標準差
+      const mean = norm.reduce((a, b) => a + b, 0) / norm.length;
+      const variance = norm.reduce((a, b) => a + (b - mean) ** 2, 0) / norm.length;
+      const std = Math.sqrt(variance);
+
+      // 自適應 threshold：平均 + α*std （可微調 0.2 ~ 0.4）
+      const threshold = mean + 0.25 * std;
+
+      const rawBits = norm.map(v => (v > threshold ? 1 : 0));
+
+      // run-length 壓縮 + 過濾太短的段落
+      const compressed = [];
+      let current = rawBits[0];
+      let count = 1;
+      for (let i = 1; i < rawBits.length; i++) {
+        if (rawBits[i] === current) {
+          count++;
+        } else {
+          compressed.push({ value: current, len: count });
+          current = rawBits[i];
+          count = 1;
+        }
+      }
+      compressed.push({ value: current, len: count });
+
+      const minLen = Math.floor(norm.length * 0.01); // 可調，避免短雜訊
+      const filtered = compressed.filter(seg => seg.len >= minLen);
+
+      return filtered.map(seg => seg.value).join("");
+    }
+
+    // 協定解碼：找 HEADER = "10101011"，後面 8 bits 當 payload
+    function decodeProtocol(bitString) {
+      const HEADER = "10101011";
+      if (!bitString || bitString.length < HEADER.length + 8) return null;
+
+      // 嘗試在 bit 串中找到 HEADER
+      const maxStart = bitString.length - (HEADER.length + 8);
+      for (let i = 0; i <= maxStart; i++) {
+        const candidate = bitString.slice(i, i + HEADER.length);
+        if (candidate === HEADER) {
+          const payloadBits = bitString.slice(i + HEADER.length, i + HEADER.length + 8);
+          if (payloadBits.length < 8) continue;
+
+          const code = parseInt(payloadBits, 2);
+          const ch = (code >= 32 && code <= 126) ? String.fromCharCode(code) : "?";
+
+          return {
+            header: HEADER,
+            payloadBits,
+            code,
+            char: ch
+          };
+        }
+      }
+      return null;
+    }
+
+    startBtn.addEventListener("click", () => {
+      if (!stream) {
+        startCamera();
+      }
+    });
+  </script>
+</body>
+</html>
